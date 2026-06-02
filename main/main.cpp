@@ -17,22 +17,23 @@
 
 static const char *TAG = "pyDrone";
 
-// --- Pin Definitions ---
+// --- Pin Definitions (From Schematic) ---
 #define MOTOR1_PIN GPIO_NUM_4
 #define MOTOR2_PIN GPIO_NUM_5
 #define MOTOR3_PIN GPIO_NUM_40
 #define MOTOR4_PIN GPIO_NUM_41
 
 #define I2C_SDA_PIN GPIO_NUM_16
-#define I2C_SCL_PIN GPIO_NUM_17
+#define I2C_SCL_PIN GPIO_NUM_15
 
 #define VBAT_ADC_CHANNEL ADC_CHANNEL_1 // GPIO2
+#define MPU6050_ADDR 0x68
 
 #define LED_BLUE GPIO_NUM_46
 #define LED_GREEN GPIO_NUM_42
 
 // --- ESP-NOW Global State ---
-static uint8_t controller_mac[6] = {0};
+static const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static bool controller_connected = false;
 static uint32_t last_packet_time = 0;
 
@@ -42,19 +43,20 @@ static int16_t current_pit = 0;
 static int16_t current_yaw = 0;
 static int16_t current_thr = 0;
 
+// Hardware telemetry
+static float drone_rol = 0.0f;
+static float drone_pit = 0.0f;
+static float drone_yaw = 0.0f;
+
 // --- State Machine & Flight Variables ---
 static bool is_flying = false;
 static int16_t target_height_cm = 0;
-static float current_height_cm = 0.0f; // Altitude tracking (simulated/sensor)
+static float current_height_cm = 0.0f; 
 
-// Simple dead reckoning position tracking relative to starting position
 static float current_x = 0.0f; 
 static float current_y = 0.0f;
-
 static bool returning_to_origin = false;
 static uint32_t origin_reached_time = 0;
-
-// Button Edge Detection Helper
 static uint8_t last_btns = 0;
 
 // Initialize PWM for 4 Brushless/Brushed Motors
@@ -83,22 +85,18 @@ void init_motors() {
     }
 }
 
-// Set Motor PWM Duty (0 - 1023)
 void set_motor_speed(int motor_idx, uint32_t duty) {
     if (duty > 1023) duty = 1023;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)motor_idx, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)motor_idx);
 }
 
-// Stop all motors instantly
 void stop_motors() {
-    for (int i = 0; i < 4; i++) {
-        set_motor_speed(i, 0);
-    }
+    for (int i = 0; i < 4; i++) set_motor_speed(i, 0);
 }
 
-// Initialize I2C Bus for the on-board MPU6050 and other sensors
-void init_i2c() {
+// Initialize I2C Bus and Wake up MPU6050
+void init_i2c_and_mpu6050() {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_SDA_PIN,
@@ -110,6 +108,50 @@ void init_i2c() {
     };
     i2c_param_config(I2C_NUM_0, &conf);
     i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+
+    // Wake MPU6050 from Sleep Mode
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x6B, true); // PWR_MGMT_1 Register
+    i2c_master_write_byte(cmd, 0x00, true); // Wake up
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+
+    if (ret != ESP_OK) ESP_LOGE(TAG, "MPU6050 Init Failed!");
+}
+
+// Read raw hardware axis to variables
+void read_mpu6050() {
+    uint8_t data[14];
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x3B, true); // ACCEL_XOUT_H
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read(cmd, data, 13, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, data + 13, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    
+    if (i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100)) == ESP_OK) {
+        int16_t ax = (data[0] << 8) | data[1];
+        int16_t ay = (data[2] << 8) | data[3];
+        int16_t az = (data[4] << 8) | data[5];
+        int16_t gz = (data[12] << 8) | data[13];
+
+        // Accelerometer-based static tilt
+        drone_pit = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+        drone_rol = atan2(ay, az) * 180.0 / M_PI;
+
+        // Simple integration loop for yaw
+        float gz_dps = gz / 131.0f;
+        drone_yaw += gz_dps * 0.05f; // 50ms tick
+        if (drone_yaw > 180.0f) drone_yaw -= 360.0f;
+        if (drone_yaw < -180.0f) drone_yaw += 360.0f;
+    }
+    i2c_cmd_link_delete(cmd);
 }
 
 // Initialize ADC for Battery reading
@@ -123,7 +165,7 @@ adc_oneshot_unit_handle_t init_adc() {
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
     adc_oneshot_chan_cfg_t config = {
-        .atten = ADC_ATTEN_DB_0,
+        .atten = ADC_ATTEN_DB_0, // Max scale ~1.1V for Voltage divider precision
         .bitwidth = ADC_BITWIDTH_DEFAULT
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, VBAT_ADC_CHANNEL, &config));
@@ -133,34 +175,24 @@ adc_oneshot_unit_handle_t init_adc() {
 // Maps [0 - 255] byte received into [-100, 100] target control axes
 int16_t parse_axis(uint8_t val) {
     if (val > 100 && val < 155) return 0;
-    if (val <= 100) return (int16_t)val - 100; // -100 to 0
-    return (int16_t)val - 155; // 0 to 100
+    if (val <= 100) return (int16_t)val - 100;
+    return (int16_t)val - 155;
 }
 
 // --- ESP-NOW Receive Callback ---
 void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len) {
     if (data_len == 16 && memcmp(data, "pyDRONE_DISCOVER", 16) == 0) {
-        // Send ACK back to complete pairing Handshake
-        esp_now_peer_info_t peer_info = {};
-        peer_info.channel = 1;
-        peer_info.encrypt = false;
-        memcpy(peer_info.peer_addr, esp_now_info->src_addr, 6);
-        if (!esp_now_is_peer_exist(esp_now_info->src_addr)) {
-            esp_now_add_peer(&peer_info);
-        }
-        memcpy(controller_mac, esp_now_info->src_addr, 6);
         controller_connected = true;
-        last_packet_time = xTaskGetTickCount(); // FIX: Reset timer to prevent instant failsafe disarm
+        last_packet_time = xTaskGetTickCount(); // Important: Stop failsafe from instantly triggering
         
-        esp_now_send(controller_mac, (const uint8_t*)"pyDRONE_ACK", 11);
+        esp_now_send(broadcast_mac, (const uint8_t*)"pyDRONE_ACK", 11);
         ESP_LOGI(TAG, "Sent Discovery ACK to Controller");
         return;
     }
 
-    if (data_len == 6 && data[0] == 67) { // Standard Control Packet ('C' = 67)
+    if (data_len == 6 && data[0] == 67) { 
         last_packet_time = xTaskGetTickCount();
 
-        // Extract Joystick commands
         int16_t rc_rol = parse_axis(data[1]);
         int16_t rc_pit = parse_axis(data[2]);
         current_yaw = parse_axis(data[3]);
@@ -168,89 +200,60 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
         
         uint8_t btns = data[5];
 
-        // Edge detection triggers (Activates strictly on key release-to-press transition)
         bool press_y = (btns & (1 << 4)) && !(last_btns & (1 << 4)); // Y Press
         bool press_b = (btns & (1 << 5)) && !(last_btns & (1 << 5)); // B Press
         bool press_a = (btns & (1 << 6)) && !(last_btns & (1 << 6)); // A Press
         bool press_x = (btns & (1 << 7)) && !(last_btns & (1 << 7)); // X Press
 
-        last_btns = btns; // Update state tracking
-
-        // --- BUTTON STATE MACHINE ---
+        last_btns = btns; 
         
-        // Y: Hover to 30 cm height
         if (press_y) {
             target_height_cm = 30;
             is_flying = true;
             returning_to_origin = false;
-            ESP_LOGI(TAG, "Y pressed -> Elevating to 30cm Hover height.");
         }
 
-        // B: Rise 30 cm higher (can be pressed continuously)
-        if (press_b) {
-            if (is_flying) {
-                target_height_cm += 30;
-                ESP_LOGI(TAG, "B pressed -> Target height adjusted up to: %d cm", target_height_cm);
-            }
+        if (press_b && is_flying) target_height_cm += 30;
+        
+        if (press_a && is_flying) {
+            target_height_cm -= 30;
+            if (target_height_cm < 0) target_height_cm = 0; 
         }
 
-        // A: Descend 30 cm lower (can be pressed continuously)
-        if (press_a) {
-            if (is_flying) {
-                target_height_cm -= 30;
-                if (target_height_cm < 0) target_height_cm = 0; // Prevent descending below ground
-                ESP_LOGI(TAG, "A pressed -> Target height adjusted down to: %d cm", target_height_cm);
-            }
-        }
-
-        // X: Return to origin/starting coordinate (0,0) and turn off motors after 2 seconds
-        if (press_x) {
-            if (is_flying) {
-                returning_to_origin = true;
-                ESP_LOGI(TAG, "X pressed -> Initiating Return-To-Origin sequence.");
-            }
-        }
-
-        // Handle flight controls
+        if (press_x && is_flying) returning_to_origin = true;
+        
         if (is_flying) {
             if (returning_to_origin) {
-                // Return to Origin (RTL): Overwrite manual controls to steer back to coordinate (0,0)
                 float error_x = 0.0f - current_x;
                 float error_y = 0.0f - current_y;
 
-                float kp_pos = 1.5f; // Proportional steer coefficient
+                float kp_pos = 1.5f; 
                 current_rol = (int16_t)(error_x * kp_pos);
                 current_pit = (int16_t)(error_y * kp_pos);
 
-                // Safe roll & pitch clamp limits during automatic RTL
                 if (current_rol > 30)  current_rol = 30;
                 if (current_rol < -30) current_rol = -30;
                 if (current_pit > 30)  current_pit = 30;
                 if (current_pit < -30) current_pit = -30;
 
-                // Check if we are physically back within tolerance of origin
                 if (fabs(error_x) < 2.0f && fabs(error_y) < 2.0f) {
                     current_rol = 0;
                     current_pit = 0;
 
                     if (origin_reached_time == 0) {
                         origin_reached_time = xTaskGetTickCount();
-                        ESP_LOGI(TAG, "Arrived at origin! Starting 2-second countdown to land.");
                     } else if (pdTICKS_TO_MS(xTaskGetTickCount() - origin_reached_time) >= 2000) {
-                        // 2 seconds have elapsed after returning: turn off motors
                         stop_motors();
                         is_flying = false;
                         returning_to_origin = false;
                         origin_reached_time = 0;
                         target_height_cm = 0;
-                        ESP_LOGI(TAG, "Landing timer expired. Motors turned off.");
                     }
                 }
             } else {
-                // Manual Flight Mode: Accept raw inputs from controller sticks
                 current_rol = rc_rol;
                 current_pit = rc_pit;
-                origin_reached_time = 0; // Reset timer if aborted
+                origin_reached_time = 0; 
             }
         }
     }
@@ -273,7 +276,7 @@ extern "C" void app_main(void) {
     gpio_set_level(LED_GREEN, 0);
 
     init_motors();
-    init_i2c();
+    init_i2c_and_mpu6050();
     adc_oneshot_unit_handle_t adc_handle = init_adc();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -288,6 +291,13 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
 
+    // Add broadcast address to peers list so we can transmit without failing out.
+    esp_now_peer_info_t bcast_peer = {};
+    bcast_peer.channel = 1;
+    bcast_peer.encrypt = false;
+    memcpy(bcast_peer.peer_addr, broadcast_mac, 6);
+    ESP_ERROR_CHECK(esp_now_add_peer(&bcast_peer));
+
     ESP_LOGI(TAG, "pyDrone C++ Firmware initialized.");
 
     const TickType_t interval = pdMS_TO_TICKS(50); // 20Hz physics tick
@@ -296,50 +306,51 @@ extern "C" void app_main(void) {
     while (true) {
         vTaskDelayUntil(&last_wake_time, interval);
 
-        // --- PHYSICAL DYNAMICS SIMULATION & PID PLACEHOLDER ---
+        // Run I2C Sensor reads continuously to update hardware telemetry payload
+        read_mpu6050();
+
         if (is_flying) {
-            // Dead Reckoning: Track simulated X and Y spatial displacement
             float dt = 0.05f; 
             current_x += (current_rol / 100.0f) * 40.0f * dt;
             current_y += (current_pit / 100.0f) * 40.0f * dt;
 
-            // Height Simulation tracking target height
             if (current_height_cm < target_height_cm) {
-                current_height_cm += 2.0f; // Climb rate
+                current_height_cm += 2.0f;
                 if (current_height_cm > target_height_cm) current_height_cm = target_height_cm;
             } else if (current_height_cm > target_height_cm) {
-                current_height_cm -= 2.0f; // Fall rate
+                current_height_cm -= 2.0f;
                 if (current_height_cm < target_height_cm) current_height_cm = target_height_cm;
             }
 
-            // Simple Height PID Loop Proportional Feedback
             float alt_error = target_height_cm - current_height_cm;
             float kp_alt = 6.0f;
-            int base_throttle = 450 + (alt_error * kp_alt); // Hover base index ~450
+            int base_throttle = 450 + (alt_error * kp_alt); 
             if (base_throttle < 100) base_throttle = 100;
 
-            // Output mixing to motors
-            set_motor_speed(0, base_throttle + current_rol + current_pit); // Motor 1
-            set_motor_speed(1, base_throttle - current_rol + current_pit); // Motor 2
-            set_motor_speed(2, base_throttle - current_rol - current_pit); // Motor 3
-            set_motor_speed(3, base_throttle + current_rol - current_pit); // Motor 4
-
-            ESP_LOGI(TAG, "Telemetry -> Pos: (X:%.2f, Y:%.2f) | Height: %.1fcm / Target: %dcm", 
-                     current_x, current_y, current_height_cm, target_height_cm);
+            set_motor_speed(0, base_throttle + current_rol + current_pit); 
+            set_motor_speed(1, base_throttle - current_rol + current_pit); 
+            set_motor_speed(2, base_throttle - current_rol - current_pit); 
+            set_motor_speed(3, base_throttle + current_rol - current_pit); 
         }
 
         // --- ENCODE AND SEND TELEMETRY PACKET (18-Byte Big-Endian Offset) ---
         if (controller_connected) {
+            
+            // Read ADC for battery 40.2K/10K voltage divider scaling
+            int vbat_raw;
+            adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
+            float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
+
             int16_t state_buf_local[9];
-            state_buf_local[0] = current_rol * 100; // Drone Roll * 100
-            state_buf_local[1] = current_pit * 100; // Drone Pitch * 100
-            state_buf_local[2] = current_yaw * 100; // Drone Yaw * 100
-            state_buf_local[3] = current_rol * 10;  // Controller roll visual loopback
-            state_buf_local[4] = current_pit * 10;  // Controller pitch visual loopback
-            state_buf_local[5] = current_yaw * 200; // Controller yaw visual loopback
-            state_buf_local[6] = (int16_t)((current_thr + 100) / 2); // Unpack thrust using factory logic
-            state_buf_local[7] = 391;               // Battery * 100 (Simulated 3.91 V)
-            state_buf_local[8] = (int16_t)(current_height_cm); // Altitude * 100 (Simulated Alt in cm)
+            state_buf_local[0] = (int16_t)(drone_rol * 100); 
+            state_buf_local[1] = (int16_t)(drone_pit * 100); 
+            state_buf_local[2] = (int16_t)(drone_yaw * 100); 
+            state_buf_local[3] = current_rol * 10;  
+            state_buf_local[4] = current_pit * 10;  
+            state_buf_local[5] = current_yaw * 200; 
+            state_buf_local[6] = (int16_t)((current_thr + 100) / 2); 
+            state_buf_local[7] = (int16_t)(vbat * 100);               
+            state_buf_local[8] = (int16_t)(current_height_cm); 
 
             uint8_t tx_buf[18];
             for (int i = 0; i < 9; i++) {
@@ -347,10 +358,10 @@ extern "C" void app_main(void) {
                 tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
                 tx_buf[i * 2 + 1] = val_offset & 0xFF;
             }
-            esp_now_send(controller_mac, tx_buf, sizeof(tx_buf));
+            // Fix: Send telemetry directly to Broadcast MAC so Unicast ACKs don't get dropped by sniffer
+            esp_now_send(broadcast_mac, tx_buf, sizeof(tx_buf));
         }
 
-        // Failsafe connection check (Timeout triggers disarm if controller cuts out)
         if (controller_connected) {
             uint32_t now = xTaskGetTickCount();
             if (pdTICKS_TO_MS(now - last_packet_time) > 500) {
