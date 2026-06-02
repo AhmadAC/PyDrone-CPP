@@ -2,9 +2,9 @@ name: Build C++ Firmware
 
 on:
   push:
-    branches: [ pydrone, master ]
+    branches: [ pydrone, master, main ]
   pull_request:
-    branches: [ pydrone, master ]
+    branches: [ pydrone, master, main ]
   workflow_dispatch: 
 
 jobs:
