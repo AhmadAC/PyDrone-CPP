@@ -1,0 +1,33 @@
+name: Build C++ Firmware
+
+on:
+  push:
+    branches: [ pydrone, master ]
+  pull_request:
+    branches: [ pydrone, master ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Firmware and Merge Binaries
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32s3
+          # Move into the pyDrone project directory, build the firmware, and merge binaries
+          command: |
+            cd PyDrone-cpp && \
+            idf.py build && \
+            cd build && \
+            esptool.py --chip esp32s3 merge_bin -o merged-pydrone-s3.bin --fill-flash-size 4MB @flash_args
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyDrone
+          path: PyDrone-cpp/build/merged-pydrone-s3.bin
