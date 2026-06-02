@@ -19,9 +19,8 @@ jobs:
         with:
           esp_idf_version: v5.3.1
           target: esp32s3
-          # Move into the pyDrone project directory, build the firmware, and merge binaries
+          # Build directly from the repository root since CMakeLists.txt is located here
           command: |
-            cd PyDrone-cpp && \
             idf.py build && \
             cd build && \
             esptool.py --chip esp32s3 merge_bin -o merged-pydrone-s3.bin --fill-flash-size 4MB @flash_args
@@ -30,4 +29,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pyDrone
-          path: PyDrone-cpp/build/merged-pydrone-s3.bin
+          path: build/merged-pydrone-s3.bin
