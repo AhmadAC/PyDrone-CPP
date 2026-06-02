@@ -1,3 +1,4 @@
+// PyDrone-cpp/main/main.cpp
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -149,6 +150,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
         }
         memcpy(controller_mac, esp_now_info->src_addr, 6);
         controller_connected = true;
+        last_packet_time = xTaskGetTickCount(); // FIX: Reset timer to prevent instant failsafe disarm
         
         esp_now_send(controller_mac, (const uint8_t*)"pyDRONE_ACK", 11);
         ESP_LOGI(TAG, "Sent Discovery ACK to Controller");
@@ -297,12 +299,11 @@ extern "C" void app_main(void) {
         // --- PHYSICAL DYNAMICS SIMULATION & PID PLACEHOLDER ---
         if (is_flying) {
             // Dead Reckoning: Track simulated X and Y spatial displacement
-            // Pitch tilts drone on Y axis, Roll tilts drone on X axis
             float dt = 0.05f; 
             current_x += (current_rol / 100.0f) * 40.0f * dt;
             current_y += (current_pit / 100.0f) * 40.0f * dt;
 
-            // Height Simulation tracking target height (To be swapped with Barometer sensor reading)
+            // Height Simulation tracking target height
             if (current_height_cm < target_height_cm) {
                 current_height_cm += 2.0f; // Climb rate
                 if (current_height_cm > target_height_cm) current_height_cm = target_height_cm;
@@ -325,6 +326,28 @@ extern "C" void app_main(void) {
 
             ESP_LOGI(TAG, "Telemetry -> Pos: (X:%.2f, Y:%.2f) | Height: %.1fcm / Target: %dcm", 
                      current_x, current_y, current_height_cm, target_height_cm);
+        }
+
+        // --- ENCODE AND SEND TELEMETRY PACKET (18-Byte Big-Endian Offset) ---
+        if (controller_connected) {
+            int16_t state_buf_local[9];
+            state_buf_local[0] = current_rol * 100; // Drone Roll * 100
+            state_buf_local[1] = current_pit * 100; // Drone Pitch * 100
+            state_buf_local[2] = current_yaw * 100; // Drone Yaw * 100
+            state_buf_local[3] = current_rol * 10;  // Controller roll visual loopback
+            state_buf_local[4] = current_pit * 10;  // Controller pitch visual loopback
+            state_buf_local[5] = current_yaw * 200; // Controller yaw visual loopback
+            state_buf_local[6] = (int16_t)((current_thr + 100) / 2); // Unpack thrust using factory logic
+            state_buf_local[7] = 391;               // Battery * 100 (Simulated 3.91 V)
+            state_buf_local[8] = (int16_t)(current_height_cm); // Altitude * 100 (Simulated Alt in cm)
+
+            uint8_t tx_buf[18];
+            for (int i = 0; i < 9; i++) {
+                uint16_t val_offset = (uint16_t)(state_buf_local[i] + 32768);
+                tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
+                tx_buf[i * 2 + 1] = val_offset & 0xFF;
+            }
+            esp_now_send(controller_mac, tx_buf, sizeof(tx_buf));
         }
 
         // Failsafe connection check (Timeout triggers disarm if controller cuts out)
