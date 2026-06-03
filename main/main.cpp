@@ -277,7 +277,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
                 current_x = 0.0f; 
                 current_y = 0.0f;
             }
-            target_height_cm = 30;
+            target_height_cm = 120; // Take off to 120cm
             is_flying = true;
             returning_to_origin = false;
         }
