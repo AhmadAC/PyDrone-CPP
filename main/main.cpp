@@ -114,6 +114,7 @@ void init_i2c_and_mpu6050() {
     i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
 
     // Wake MPU6050 from Sleep Mode
+    vTaskDelay(pdMS_TO_TICKS(20)); // Small delay to let MPU stabilize
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -214,6 +215,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
 
     if (data_len >= 6 && data[0] == 67) { 
         last_packet_time = xTaskGetTickCount();
+        controller_connected = true; // Refresh connection state just in case
 
         int16_t rc_rol = parse_axis(data[1]);
         int16_t rc_pit = parse_axis(data[2]);
@@ -365,40 +367,41 @@ extern "C" void app_main(void) {
         }
 
         // --- ENCODE AND SEND TELEMETRY PACKET (18-Byte Big-Endian Offset) ---
-        if (controller_connected) {
-            
-            // Read ADC for battery 40.2K/10K voltage divider scaling
-            int vbat_raw;
-            adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
-            float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
+        // MOVED OUTSIDE `if (controller_connected)` so it always broadcasts!
+        
+        // Read ADC for battery 40.2K/10K voltage divider scaling
+        int vbat_raw;
+        adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
+        float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
 
-            int16_t state_buf_local[9];
-            state_buf_local[0] = (int16_t)(drone_rol * 100); 
-            state_buf_local[1] = (int16_t)(drone_pit * 100); 
-            state_buf_local[2] = (int16_t)(drone_yaw * 100); 
-            state_buf_local[3] = current_rol * 10;  
-            state_buf_local[4] = current_pit * 10;  
-            state_buf_local[5] = current_yaw * 200; 
-            state_buf_local[6] = (int16_t)((current_thr + 100) / 2); 
-            state_buf_local[7] = (int16_t)(vbat * 100);               
-            state_buf_local[8] = (int16_t)(current_height_cm); 
+        int16_t state_buf_local[9];
+        state_buf_local[0] = (int16_t)(drone_rol * 100); 
+        state_buf_local[1] = (int16_t)(drone_pit * 100); 
+        state_buf_local[2] = (int16_t)(drone_yaw * 100); 
+        state_buf_local[3] = current_rol * 10;  
+        state_buf_local[4] = current_pit * 10;  
+        state_buf_local[5] = current_yaw * 200; 
+        state_buf_local[6] = (int16_t)((current_thr + 100) / 2); 
+        state_buf_local[7] = (int16_t)(vbat * 100);               
+        state_buf_local[8] = (int16_t)(current_height_cm); 
 
-            uint8_t tx_buf[18];
-            for (int i = 0; i < 9; i++) {
-                uint16_t val_offset = (uint16_t)(state_buf_local[i] + 32768);
-                tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
-                tx_buf[i * 2 + 1] = val_offset & 0xFF;
-            }
-            // Send telemetry directly to Broadcast MAC so Unicast ACKs don't get dropped by sniffer
-            esp_now_send(broadcast_mac, tx_buf, sizeof(tx_buf));
+        uint8_t tx_buf[18];
+        for (int i = 0; i < 9; i++) {
+            uint16_t val_offset = (uint16_t)(state_buf_local[i] + 32768);
+            tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
+            tx_buf[i * 2 + 1] = val_offset & 0xFF;
         }
+        
+        // Send telemetry directly to Broadcast MAC unconditionally 
+        esp_now_send(broadcast_mac, tx_buf, sizeof(tx_buf));
 
+        // Handle failsafe shutdown separately
         if (controller_connected) {
             uint32_t now = xTaskGetTickCount();
             if (pdTICKS_TO_MS(now - last_packet_time) > 500) {
                 stop_motors();
                 is_flying = false;
-                controller_connected = false;
+                controller_connected = false; // Note: Telemetry broadcast keeps running!
                 gpio_set_level(LED_GREEN, 0);
                 ESP_LOGW(TAG, "Connection Lost! Motors powered down.");
             } else {
