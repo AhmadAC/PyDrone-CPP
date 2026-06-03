@@ -63,6 +63,9 @@ static bool returning_to_origin = false;
 static uint32_t origin_reached_time = 0;
 static uint8_t last_btns = 8; // Default POV Hat is 8 (Neutral)
 
+// Track active, ramped motor speeds globally to preserve state between loops
+static float active_motor_speed[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
 // Initialize PWM for 4 Brushless/Brushed Motors
 void init_motors() {
     ledc_timer_config_t timer_conf = {
@@ -96,7 +99,10 @@ void set_motor_speed(int motor_idx, uint32_t duty) {
 }
 
 void stop_motors() {
-    for (int i = 0; i < 4; i++) set_motor_speed(i, 0);
+    for (int i = 0; i < 4; i++) {
+        active_motor_speed[i] = 0.0f; // Clear current soft-start tracking memory
+        set_motor_speed(i, 0);
+    }
 }
 
 // Initialize I2C Bus and Wake up MPU6050
@@ -397,12 +403,40 @@ extern "C" void app_main(void) {
             float alt_error = target_height_cm - current_height_cm;
             float kp_alt = 6.0f;
             int base_throttle = 450 + (alt_error * kp_alt); 
+            
+            // Limit base_throttle step to 750 max to prevent massive immediate current draw on takeoff
+            if (base_throttle > 750) base_throttle = 750;
             if (base_throttle < 100) base_throttle = 100;
 
-            set_motor_speed(0, base_throttle + current_rol + current_pit); 
-            set_motor_speed(1, base_throttle - current_rol + current_pit); 
-            set_motor_speed(2, base_throttle - current_rol - current_pit); 
-            set_motor_speed(3, base_throttle + current_rol - current_pit); 
+            int target_speed[4];
+            target_speed[0] = base_throttle + current_rol + current_pit; 
+            target_speed[1] = base_throttle - current_rol + current_pit; 
+            target_speed[2] = base_throttle - current_rol - current_pit; 
+            target_speed[3] = base_throttle + current_rol - current_pit; 
+
+            // Smooth ramping (slew-rate limiting) to prevent battery brownouts
+            const float max_increase_per_tick = 35.0f; // Soft-start ramp rate
+            for (int i = 0; i < 4; i++) {
+                if (target_speed[i] > 780) target_speed[i] = 780; // Hard clamp max current draw on battery
+                if (target_speed[i] < 0) target_speed[i] = 0;
+
+                if (target_speed[i] > active_motor_speed[i]) {
+                    active_motor_speed[i] += max_increase_per_tick;
+                    if (active_motor_speed[i] > target_speed[i]) {
+                        active_motor_speed[i] = (float)target_speed[i];
+                    }
+                } else {
+                    // Instantly reduce speed if targets drop (for safety and responsiveness)
+                    active_motor_speed[i] = (float)target_speed[i];
+                }
+                set_motor_speed(i, (uint32_t)active_motor_speed[i]);
+            }
+        } else {
+            // Ensure motor speeds are kept at 0 when not flying
+            for (int i = 0; i < 4; i++) {
+                active_motor_speed[i] = 0.0f;
+                set_motor_speed(i, 0);
+            }
         }
 
         // --- ENCODE AND SEND TELEMETRY PACKET (18-Byte Big-Endian Offset) ---
