@@ -48,6 +48,10 @@ static float drone_rol = 0.0f;
 static float drone_pit = 0.0f;
 static float drone_yaw = 0.0f;
 
+// Calibration offsets
+static float calib_rol_offset = 0.0f;
+static float calib_pit_offset = 0.0f;
+
 // --- State Machine & Flight Variables ---
 static bool is_flying = false;
 static int16_t target_height_cm = 0;
@@ -142,8 +146,12 @@ void read_mpu6050() {
         int16_t gz = (data[12] << 8) | data[13];
 
         // Accelerometer-based static tilt
-        drone_pit = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
-        drone_rol = atan2(ay, az) * 180.0 / M_PI;
+        float raw_pit = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+        float raw_rol = atan2(ay, az) * 180.0 / M_PI;
+
+        // Apply dynamic offsets (calibrated via DPAD UP)
+        drone_pit = raw_pit - calib_pit_offset;
+        drone_rol = raw_rol - calib_rol_offset;
 
         // Simple integration loop for yaw
         float gz_dps = gz / 131.0f;
@@ -181,16 +189,30 @@ int16_t parse_axis(uint8_t val) {
 
 // --- ESP-NOW Receive Callback ---
 void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len) {
-    if (data_len == 16 && memcmp(data, "pyDRONE_DISCOVER", 16) == 0) {
+    if (data_len >= 16 && memcmp(data, "pyDRONE_DISCOVER", 16) == 0) {
         controller_connected = true;
         last_packet_time = xTaskGetTickCount(); // Important: Stop failsafe from instantly triggering
         
+        // Add the controller to the ESP-NOW peer list so that the drone stack accepts unicast control packets
+        if (!esp_now_is_peer_exist(esp_now_info->src_addr)) {
+            esp_now_peer_info_t peer_info = {};
+            peer_info.channel = 1;
+            peer_info.encrypt = false;
+            memcpy(peer_info.peer_addr, esp_now_info->src_addr, 6);
+            esp_err_t err = esp_now_add_peer(&peer_info);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to add controller peer: %s", esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG, "Added Controller to Peer List");
+            }
+        }
+
         esp_now_send(broadcast_mac, (const uint8_t*)"pyDRONE_ACK", 11);
         ESP_LOGI(TAG, "Sent Discovery ACK to Controller");
         return;
     }
 
-    if (data_len == 6 && data[0] == 67) { 
+    if (data_len >= 6 && data[0] == 67) { 
         last_packet_time = xTaskGetTickCount();
 
         int16_t rc_rol = parse_axis(data[1]);
@@ -200,13 +222,22 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
         
         uint8_t btns = data[5];
 
-        bool press_y = (btns & (1 << 4)) && !(last_btns & (1 << 4)); // Y Press
-        bool press_b = (btns & (1 << 5)) && !(last_btns & (1 << 5)); // B Press
-        bool press_a = (btns & (1 << 6)) && !(last_btns & (1 << 6)); // A Press
-        bool press_x = (btns & (1 << 7)) && !(last_btns & (1 << 7)); // X Press
+        bool press_up = (btns & (1 << 0)) && !(last_btns & (1 << 0)); // D-Pad UP Press
+        bool press_y  = (btns & (1 << 4)) && !(last_btns & (1 << 4)); // Y Press
+        bool press_b  = (btns & (1 << 5)) && !(last_btns & (1 << 5)); // B Press
+        bool press_a  = (btns & (1 << 6)) && !(last_btns & (1 << 6)); // A Press
+        bool press_x  = (btns & (1 << 7)) && !(last_btns & (1 << 7)); // X Press
 
         last_btns = btns; 
         
+        // Calibration Triggered by DPAD UP
+        if (press_up) {
+            calib_rol_offset += drone_rol;
+            calib_pit_offset += drone_pit;
+            drone_yaw = 0.0f; // Zero out yaw memory
+            ESP_LOGI(TAG, "Gyro Calibrated! ROL Offset: %.2f | PIT Offset: %.2f", calib_rol_offset, calib_pit_offset);
+        }
+
         if (press_y) {
             target_height_cm = 30;
             is_flying = true;
@@ -222,39 +253,39 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
 
         if (press_x && is_flying) returning_to_origin = true;
         
-        if (is_flying) {
-            if (returning_to_origin) {
-                float error_x = 0.0f - current_x;
-                float error_y = 0.0f - current_y;
+        if (is_flying && returning_to_origin) {
+            float error_x = 0.0f - current_x;
+            float error_y = 0.0f - current_y;
 
-                float kp_pos = 1.5f; 
-                current_rol = (int16_t)(error_x * kp_pos);
-                current_pit = (int16_t)(error_y * kp_pos);
+            float kp_pos = 1.5f; 
+            current_rol = (int16_t)(error_x * kp_pos);
+            current_pit = (int16_t)(error_y * kp_pos);
 
-                if (current_rol > 30)  current_rol = 30;
-                if (current_rol < -30) current_rol = -30;
-                if (current_pit > 30)  current_pit = 30;
-                if (current_pit < -30) current_pit = -30;
+            if (current_rol > 30)  current_rol = 30;
+            if (current_rol < -30) current_rol = -30;
+            if (current_pit > 30)  current_pit = 30;
+            if (current_pit < -30) current_pit = -30;
 
-                if (fabs(error_x) < 2.0f && fabs(error_y) < 2.0f) {
-                    current_rol = 0;
-                    current_pit = 0;
+            if (fabs(error_x) < 2.0f && fabs(error_y) < 2.0f) {
+                current_rol = 0;
+                current_pit = 0;
 
-                    if (origin_reached_time == 0) {
-                        origin_reached_time = xTaskGetTickCount();
-                    } else if (pdTICKS_TO_MS(xTaskGetTickCount() - origin_reached_time) >= 2000) {
-                        stop_motors();
-                        is_flying = false;
-                        returning_to_origin = false;
-                        origin_reached_time = 0;
-                        target_height_cm = 0;
-                    }
+                if (origin_reached_time == 0) {
+                    origin_reached_time = xTaskGetTickCount();
+                } else if (pdTICKS_TO_MS(xTaskGetTickCount() - origin_reached_time) >= 2000) {
+                    stop_motors();
+                    is_flying = false;
+                    returning_to_origin = false;
+                    origin_reached_time = 0;
+                    target_height_cm = 0;
                 }
-            } else {
-                current_rol = rc_rol;
-                current_pit = rc_pit;
-                origin_reached_time = 0; 
             }
+        } else {
+            // Apply joystick inputs continuously even when not actively returning or disarmed
+            // This allows the Controller Screen to display accurate realtime targets
+            current_rol = rc_rol;
+            current_pit = rc_pit;
+            origin_reached_time = 0; 
         }
     }
 }
@@ -358,7 +389,7 @@ extern "C" void app_main(void) {
                 tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
                 tx_buf[i * 2 + 1] = val_offset & 0xFF;
             }
-            // Fix: Send telemetry directly to Broadcast MAC so Unicast ACKs don't get dropped by sniffer
+            // Send telemetry directly to Broadcast MAC so Unicast ACKs don't get dropped by sniffer
             esp_now_send(broadcast_mac, tx_buf, sizeof(tx_buf));
         }
 
