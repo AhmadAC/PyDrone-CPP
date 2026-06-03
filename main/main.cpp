@@ -224,14 +224,19 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
         
         uint8_t btns = data[5];
 
-        // --- FIX: DECODE POV HAT & ACTION BUTTONS PROPERLY ---
+        // --- DECODE POV HAT & ACTION BUTTONS ---
         uint8_t pov = btns & 0x0F;
         uint8_t last_pov = last_btns & 0x0F;
         
-        // 0=UP, 1=UP-RIGHT, 7=UP-LEFT (Tolerate diagonal thumbs)
+        // 0=UP, 1=UP-RIGHT, 7=UP-LEFT
         bool is_up = (pov == 0 || pov == 1 || pov == 7);
         bool was_up = (last_pov == 0 || last_pov == 1 || last_pov == 7);
         bool press_up = is_up && !was_up; 
+
+        // 4=DOWN, 3=DOWN-RIGHT, 5=DOWN-LEFT
+        bool is_down = (pov == 3 || pov == 4 || pov == 5);
+        bool was_down = (last_pov == 3 || last_pov == 4 || last_pov == 5);
+        bool press_down = is_down && !was_down; 
 
         // Action buttons are bitmasks on the upper nibble
         bool press_y  = (btns & (1 << 4)) && !(last_btns & (1 << 4)); // Y Press
@@ -240,8 +245,18 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
         bool press_x  = (btns & (1 << 7)) && !(last_btns & (1 << 7)); // X Press
 
         last_btns = btns; 
+
+        // 1. KILL SWITCH (Highest Priority)
+        if (press_x) {
+            is_flying = false;
+            returning_to_origin = false;
+            target_height_cm = 0;
+            current_height_cm = 0;
+            stop_motors(); // Extremely fast hardware PWM halt
+            ESP_LOGW(TAG, "EMERGENCY STOP (X pressed)! Motors killed instantly.");
+        }
         
-        // Calibration Triggered by DPAD UP
+        // 2. Gyro Calibration (Triggered by DPAD UP)
         if (press_up) {
             calib_rol_offset += drone_rol;
             calib_pit_offset += drone_pit;
@@ -249,7 +264,19 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
             ESP_LOGI(TAG, "Gyro Calibrated! ROL Offset: %.2f | PIT Offset: %.2f", calib_rol_offset, calib_pit_offset);
         }
 
+        // 3. Return to Origin (Triggered by DPAD DOWN)
+        if (press_down && is_flying) {
+            returning_to_origin = true;
+            ESP_LOGI(TAG, "Return to Origin Initiated!");
+        }
+
+        // 4. Flight Commands
         if (press_y) {
+            if (!is_flying) {
+                // If taking off from ground, make current spot the new (0, 0) origin point
+                current_x = 0.0f; 
+                current_y = 0.0f;
+            }
             target_height_cm = 30;
             is_flying = true;
             returning_to_origin = false;
@@ -262,8 +289,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
             if (target_height_cm < 0) target_height_cm = 0; 
         }
 
-        if (press_x && is_flying) returning_to_origin = true;
-        
+        // 5. Automatic Flight / Joystick Override Control
         if (is_flying && returning_to_origin) {
             float error_x = 0.0f - current_x;
             float error_y = 0.0f - current_y;
@@ -272,6 +298,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
             current_rol = (int16_t)(error_x * kp_pos);
             current_pit = (int16_t)(error_y * kp_pos);
 
+            // Constraint boundaries to prevent aggressive tilt during RTH
             if (current_rol > 30)  current_rol = 30;
             if (current_rol < -30) current_rol = -30;
             if (current_pit > 30)  current_pit = 30;
@@ -284,6 +311,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
                 if (origin_reached_time == 0) {
                     origin_reached_time = xTaskGetTickCount();
                 } else if (pdTICKS_TO_MS(xTaskGetTickCount() - origin_reached_time) >= 2000) {
+                    // Hovered at origin for 2 seconds, auto-land.
                     stop_motors();
                     is_flying = false;
                     returning_to_origin = false;
@@ -292,7 +320,7 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
                 }
             }
         } else {
-            // Apply joystick inputs continuously even when not actively returning or disarmed
+            // Apply joystick inputs continuously even when not actively flying or returning
             // This allows the Controller Screen to display accurate realtime targets
             current_rol = rc_rol;
             current_pit = rc_pit;
@@ -352,10 +380,12 @@ extern "C" void app_main(void) {
         read_mpu6050();
 
         if (is_flying) {
+            // Positional Integration (Track drift relative to takeoff origin)
             float dt = 0.05f; 
             current_x += (current_rol / 100.0f) * 40.0f * dt;
             current_y += (current_pit / 100.0f) * 40.0f * dt;
 
+            // Height Management
             if (current_height_cm < target_height_cm) {
                 current_height_cm += 2.0f;
                 if (current_height_cm > target_height_cm) current_height_cm = target_height_cm;
@@ -410,6 +440,7 @@ extern "C" void app_main(void) {
             if (pdTICKS_TO_MS(now - last_packet_time) > 500) {
                 stop_motors();
                 is_flying = false;
+                returning_to_origin = false;
                 controller_connected = false; // Note: Telemetry broadcast keeps running!
                 gpio_set_level(LED_GREEN, 0);
                 ESP_LOGW(TAG, "Connection Lost! Motors powered down.");
