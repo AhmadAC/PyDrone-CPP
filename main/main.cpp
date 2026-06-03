@@ -61,7 +61,7 @@ static float current_x = 0.0f;
 static float current_y = 0.0f;
 static bool returning_to_origin = false;
 static uint32_t origin_reached_time = 0;
-static uint8_t last_btns = 0;
+static uint8_t last_btns = 8; // Default POV Hat is 8 (Neutral)
 
 // Initialize PWM for 4 Brushless/Brushed Motors
 void init_motors() {
@@ -224,7 +224,16 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
         
         uint8_t btns = data[5];
 
-        bool press_up = (btns & (1 << 0)) && !(last_btns & (1 << 0)); // D-Pad UP Press
+        // --- FIX: DECODE POV HAT & ACTION BUTTONS PROPERLY ---
+        uint8_t pov = btns & 0x0F;
+        uint8_t last_pov = last_btns & 0x0F;
+        
+        // 0=UP, 1=UP-RIGHT, 7=UP-LEFT (Tolerate diagonal thumbs)
+        bool is_up = (pov == 0 || pov == 1 || pov == 7);
+        bool was_up = (last_pov == 0 || last_pov == 1 || last_pov == 7);
+        bool press_up = is_up && !was_up; 
+
+        // Action buttons are bitmasks on the upper nibble
         bool press_y  = (btns & (1 << 4)) && !(last_btns & (1 << 4)); // Y Press
         bool press_b  = (btns & (1 << 5)) && !(last_btns & (1 << 5)); // B Press
         bool press_a  = (btns & (1 << 6)) && !(last_btns & (1 << 6)); // A Press
