@@ -109,7 +109,7 @@ void stop_motors() {
     }
 }
 
-// Initialize I2C Bus and Wake up MPU6050
+// Initialize I2C Bus, Wake up MPU6050, and apply low-pass filtering
 void init_i2c_and_mpu6050() {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -123,7 +123,7 @@ void init_i2c_and_mpu6050() {
     i2c_param_config(I2C_NUM_0, &conf);
     i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
 
-    // Wake MPU6050 from Sleep Mode
+    // 1. Wake MPU6050 from Sleep Mode
     vTaskDelay(pdMS_TO_TICKS(20)); // Small delay to let MPU stabilize
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
@@ -134,7 +134,27 @@ void init_i2c_and_mpu6050() {
     esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(1000));
     i2c_cmd_link_delete(cmd);
 
-    if (ret != ESP_OK) ESP_LOGE(TAG, "MPU6050 Init Failed!");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MPU6050 Wake-up Failed!");
+        return;
+    }
+
+    // 2. Configure MPU6050 Digital Low Pass Filter (DLPF) to 42Hz
+    // Strongly suppresses mechanical coreless motor high-frequency vibrations [1, 2]
+    i2c_cmd_handle_t cmd2 = i2c_cmd_link_create();
+    i2c_master_start(cmd2);
+    i2c_master_write_byte(cmd2, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd2, 0x1A, true); // CONFIG Register
+    i2c_master_write_byte(cmd2, 0x03, true); // DLPF_CFG = 3 (42Hz filter)
+    i2c_master_stop(cmd2);
+    ret = i2c_master_cmd_begin(I2C_NUM_0, cmd2, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd2);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MPU6050 DLPF Configuration Failed!");
+    } else {
+        ESP_LOGI(TAG, "MPU6050 configured with 42Hz DLPF.");
+    }
 }
 
 // Read raw hardware axis to variables
@@ -165,7 +185,7 @@ void read_mpu6050(float dt) {
         float accel_pit = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
         float accel_rol = atan2(ay, az) * 180.0 / M_PI;
 
-        // 200Hz Complementary Filter (Filters motor vibrations while retaining responsiveness)
+        // 200Hz Complementary Filter
         drone_pit = 0.98f * (drone_pit + gy_dps * dt) + 0.02f * (accel_pit - calib_pit_offset);
         drone_rol = 0.98f * (drone_rol + gx_dps * dt) + 0.02f * (accel_rol - calib_rol_offset);
 
@@ -350,9 +370,11 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "pyDrone C++ Firmware initialized.");
 
-    const TickType_t interval = pdMS_TO_TICKS(5); // 200Hz Loop rate (Industry standard for attitude self-leveling)
+    // High speed loop running natively at 200Hz (Requires HZ=1000 configuration)
+    const TickType_t interval = pdMS_TO_TICKS(5); 
     TickType_t last_wake_time = xTaskGetTickCount();
     uint32_t last_telemetry_time = 0;
+    float smoothed_vbat = 3.7f; // Default baseline battery tracking
 
     while (true) {
         vTaskDelayUntil(&last_wake_time, interval);
@@ -360,6 +382,12 @@ extern "C" void app_main(void) {
         // Run I2C Sensor reads continuously at 200Hz to calculate absolute attitude
         float dt = 0.005f; // 5ms physics tick
         read_mpu6050(dt);
+
+        // Continuous Battery Voltage tracking (Low-pass filtered at 200Hz)
+        int vbat_raw;
+        adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
+        float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
+        smoothed_vbat = 0.95f * smoothed_vbat + 0.05f * vbat;
 
         if (is_flying) {
             // Positional Integration (Track drift relative to takeoff origin)
@@ -377,7 +405,17 @@ extern "C" void app_main(void) {
 
             float alt_error = target_height_cm - current_height_cm;
             float kp_alt = 6.0f;
-            int base_throttle = 450 + (alt_error * kp_alt); 
+            int throttle_req = 450 + (alt_error * kp_alt); 
+
+            // --- VOLTAGE COMPENSATION ---
+            // Automatically scales output upward as cell voltage drops to maintain hover consistency
+            float vbat_comp = 1.0f;
+            if (smoothed_vbat > 3.0f && smoothed_vbat < 4.3f) {
+                vbat_comp = 3.7f / smoothed_vbat; // Compensation curve
+                if (vbat_comp > 1.20f) vbat_comp = 1.20f; // Cap scale upper
+                if (vbat_comp < 0.85f) vbat_comp = 0.85f; // Cap scale lower
+            }
+            int base_throttle = (int)(throttle_req * vbat_comp);
             
             // Limit base_throttle step to 750 max to prevent massive immediate current draw on takeoff
             if (base_throttle > 750) base_throttle = 750;
@@ -392,7 +430,7 @@ extern "C" void app_main(void) {
             float roll_error = target_roll - drone_rol;
             float pitch_error = target_pitch - drone_pit;
 
-            // PD Loop Gains tuned for micro coreless quadcopters
+            // PD Loop Gains tuned for micro coreless quadcopters at 200Hz
             float kp_angle = 2.8f;
             float kd_rate = 0.12f;
             float kp_yaw_rate = 1.2f;
@@ -401,7 +439,7 @@ extern "C" void app_main(void) {
             float pid_pitch = (pitch_error * kp_angle) - (gy_dps * kd_rate);
             float pid_yaw = (target_yaw_rate) - (gz_dps * kp_yaw_rate);
 
-            // 5. Automatic Flight / Joystick Override Control
+            // Automatic Flight / Joystick Override Control
             if (returning_to_origin) {
                 float error_x = 0.0f - current_x;
                 float error_y = 0.0f - current_y;
@@ -474,11 +512,6 @@ extern "C" void app_main(void) {
         if (now_ms - last_telemetry_time >= 50) {
             last_telemetry_time = now_ms;
 
-            // Read ADC for battery 40.2K/10K voltage divider scaling
-            int vbat_raw;
-            adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
-            float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
-
             int16_t state_buf_local[9];
             state_buf_local[0] = (int16_t)(drone_rol * 100); 
             state_buf_local[1] = (int16_t)(drone_pit * 100); 
@@ -487,7 +520,7 @@ extern "C" void app_main(void) {
             state_buf_local[4] = current_pit * 10;  
             state_buf_local[5] = current_yaw * 200; 
             state_buf_local[6] = (int16_t)((current_thr + 100) / 2); 
-            state_buf_local[7] = (int16_t)(vbat * 100);               
+            state_buf_local[7] = (int16_t)(smoothed_vbat * 100);               
             state_buf_local[8] = (int16_t)(current_height_cm); 
 
             uint8_t tx_buf[18];
@@ -516,7 +549,7 @@ extern "C" void app_main(void) {
             }
         }
 
-        // Toggle blinking LED
+        // Toggle blinking LED asynchronously
         if (now_ms % 250 < 125) {
             gpio_set_level(LED_BLUE, 1);
         } else {
