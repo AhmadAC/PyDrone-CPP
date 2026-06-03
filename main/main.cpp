@@ -43,10 +43,14 @@ static int16_t current_pit = 0;
 static int16_t current_yaw = 0;
 static int16_t current_thr = 0;
 
-// Hardware telemetry
+// Hardware telemetry & IMU state
 static float drone_rol = 0.0f;
 static float drone_pit = 0.0f;
 static float drone_yaw = 0.0f;
+
+static float gx_dps = 0.0f;
+static float gy_dps = 0.0f;
+static float gz_dps = 0.0f;
 
 // Calibration offsets
 static float calib_rol_offset = 0.0f;
@@ -134,7 +138,7 @@ void init_i2c_and_mpu6050() {
 }
 
 // Read raw hardware axis to variables
-void read_mpu6050() {
+void read_mpu6050(float dt) {
     uint8_t data[14];
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
@@ -150,19 +154,23 @@ void read_mpu6050() {
         int16_t ax = (data[0] << 8) | data[1];
         int16_t ay = (data[2] << 8) | data[3];
         int16_t az = (data[4] << 8) | data[5];
+        int16_t gx = (data[8] << 8) | data[9];
+        int16_t gy = (data[10] << 8) | data[11];
         int16_t gz = (data[12] << 8) | data[13];
 
-        // Accelerometer-based static tilt
-        float raw_pit = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
-        float raw_rol = atan2(ay, az) * 180.0 / M_PI;
+        gx_dps = gx / 131.0f;
+        gy_dps = gy / 131.0f;
+        gz_dps = gz / 131.0f;
 
-        // Apply dynamic offsets (calibrated via DPAD UP)
-        drone_pit = raw_pit - calib_pit_offset;
-        drone_rol = raw_rol - calib_rol_offset;
+        float accel_pit = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+        float accel_rol = atan2(ay, az) * 180.0 / M_PI;
+
+        // 200Hz Complementary Filter (Filters motor vibrations while retaining responsiveness)
+        drone_pit = 0.98f * (drone_pit + gy_dps * dt) + 0.02f * (accel_pit - calib_pit_offset);
+        drone_rol = 0.98f * (drone_rol + gx_dps * dt) + 0.02f * (accel_rol - calib_rol_offset);
 
         // Simple integration loop for yaw
-        float gz_dps = gz / 131.0f;
-        drone_yaw += gz_dps * 0.05f; // 50ms tick
+        drone_yaw += gz_dps * dt;
         if (drone_yaw > 180.0f) drone_yaw -= 360.0f;
         if (drone_yaw < -180.0f) drone_yaw += 360.0f;
     }
@@ -295,43 +303,9 @@ void on_data_recv(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, 
             if (target_height_cm < 0) target_height_cm = 0; 
         }
 
-        // 5. Automatic Flight / Joystick Override Control
-        if (is_flying && returning_to_origin) {
-            float error_x = 0.0f - current_x;
-            float error_y = 0.0f - current_y;
-
-            float kp_pos = 1.5f; 
-            current_rol = (int16_t)(error_x * kp_pos);
-            current_pit = (int16_t)(error_y * kp_pos);
-
-            // Constraint boundaries to prevent aggressive tilt during RTH
-            if (current_rol > 30)  current_rol = 30;
-            if (current_rol < -30) current_rol = -30;
-            if (current_pit > 30)  current_pit = 30;
-            if (current_pit < -30) current_pit = -30;
-
-            if (fabs(error_x) < 2.0f && fabs(error_y) < 2.0f) {
-                current_rol = 0;
-                current_pit = 0;
-
-                if (origin_reached_time == 0) {
-                    origin_reached_time = xTaskGetTickCount();
-                } else if (pdTICKS_TO_MS(xTaskGetTickCount() - origin_reached_time) >= 2000) {
-                    // Hovered at origin for 2 seconds, auto-land.
-                    stop_motors();
-                    is_flying = false;
-                    returning_to_origin = false;
-                    origin_reached_time = 0;
-                    target_height_cm = 0;
-                }
-            }
-        } else {
-            // Apply joystick inputs continuously even when not actively flying or returning
-            // This allows the Controller Screen to display accurate realtime targets
-            current_rol = rc_rol;
-            current_pit = rc_pit;
-            origin_reached_time = 0; 
-        }
+        // Apply joystick inputs continuously even when not actively flying or returning
+        current_rol = rc_rol;
+        current_pit = rc_pit;
     }
 }
 
@@ -376,27 +350,28 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "pyDrone C++ Firmware initialized.");
 
-    const TickType_t interval = pdMS_TO_TICKS(50); // 20Hz physics tick
+    const TickType_t interval = pdMS_TO_TICKS(5); // 200Hz Loop rate (Industry standard for attitude self-leveling)
     TickType_t last_wake_time = xTaskGetTickCount();
+    uint32_t last_telemetry_time = 0;
 
     while (true) {
         vTaskDelayUntil(&last_wake_time, interval);
 
-        // Run I2C Sensor reads continuously to update hardware telemetry payload
-        read_mpu6050();
+        // Run I2C Sensor reads continuously at 200Hz to calculate absolute attitude
+        float dt = 0.005f; // 5ms physics tick
+        read_mpu6050(dt);
 
         if (is_flying) {
             // Positional Integration (Track drift relative to takeoff origin)
-            float dt = 0.05f; 
             current_x += (current_rol / 100.0f) * 40.0f * dt;
             current_y += (current_pit / 100.0f) * 40.0f * dt;
 
-            // Height Management
+            // Height Management (Slower step-increase per tick at 200Hz)
             if (current_height_cm < target_height_cm) {
-                current_height_cm += 2.0f;
+                current_height_cm += 0.2f; 
                 if (current_height_cm > target_height_cm) current_height_cm = target_height_cm;
             } else if (current_height_cm > target_height_cm) {
-                current_height_cm -= 2.0f;
+                current_height_cm -= 0.2f;
                 if (current_height_cm < target_height_cm) current_height_cm = target_height_cm;
             }
 
@@ -408,14 +383,68 @@ extern "C" void app_main(void) {
             if (base_throttle > 750) base_throttle = 750;
             if (base_throttle < 100) base_throttle = 100;
 
+            // --- 200Hz CLOSE-LOOP PID LEVEL STABILIZATION ---
+            // Map raw RC inputs to actual physical target angles (-25 to +25 degrees)
+            float target_roll = current_rol * 0.25f;
+            float target_pitch = current_pit * 0.25f;
+            float target_yaw_rate = current_yaw * 1.5f; // target degrees per second
+
+            float roll_error = target_roll - drone_rol;
+            float pitch_error = target_pitch - drone_pit;
+
+            // PD Loop Gains tuned for micro coreless quadcopters
+            float kp_angle = 2.8f;
+            float kd_rate = 0.12f;
+            float kp_yaw_rate = 1.2f;
+
+            float pid_roll = (roll_error * kp_angle) - (gx_dps * kd_rate);
+            float pid_pitch = (pitch_error * kp_angle) - (gy_dps * kd_rate);
+            float pid_yaw = (target_yaw_rate) - (gz_dps * kp_yaw_rate);
+
+            // 5. Automatic Flight / Joystick Override Control
+            if (returning_to_origin) {
+                float error_x = 0.0f - current_x;
+                float error_y = 0.0f - current_y;
+
+                float kp_pos = 1.5f; 
+                float auto_roll = error_x * kp_pos;
+                float auto_pitch = error_y * kp_pos;
+
+                // Constraint boundaries to prevent aggressive tilt during RTH
+                if (auto_roll > 10.0f)  auto_roll = 10.0f;
+                if (auto_roll < -10.0f) auto_roll = -10.0f;
+                if (auto_pitch > 10.0f)  auto_pitch = 10.0f;
+                if (auto_pitch < -10.0f) auto_pitch = -10.0f;
+
+                pid_roll = (auto_roll - drone_rol) * kp_angle - (gx_dps * kd_rate);
+                pid_pitch = (auto_pitch - drone_pit) * kp_angle - (gy_dps * kd_rate);
+
+                if (fabs(error_x) < 2.0f && fabs(error_y) < 2.0f) {
+                    pid_roll = (0.0f - drone_rol) * kp_angle - (gx_dps * kd_rate);
+                    pid_pitch = (0.0f - drone_pit) * kp_angle - (gy_dps * kd_rate);
+
+                    if (origin_reached_time == 0) {
+                        origin_reached_time = xTaskGetTickCount();
+                    } else if (pdTICKS_TO_MS(xTaskGetTickCount() - origin_reached_time) >= 2000) {
+                        // Hovered at origin for 2 seconds, auto-land.
+                        stop_motors();
+                        is_flying = false;
+                        returning_to_origin = false;
+                        origin_reached_time = 0;
+                        target_height_cm = 0;
+                    }
+                }
+            }
+
             int target_speed[4];
-            target_speed[0] = base_throttle + current_rol + current_pit; 
-            target_speed[1] = base_throttle - current_rol + current_pit; 
-            target_speed[2] = base_throttle - current_rol - current_pit; 
-            target_speed[3] = base_throttle + current_rol - current_pit; 
+            // Motor Mixing for X-Configuration Coreless Quadcopter
+            target_speed[0] = base_throttle + pid_roll + pid_pitch - pid_yaw; // Rear-Left
+            target_speed[1] = base_throttle - pid_roll + pid_pitch + pid_yaw; // Rear-Right
+            target_speed[2] = base_throttle - pid_roll - pid_pitch - pid_yaw; // Front-Right
+            target_speed[3] = base_throttle + pid_roll - pid_pitch + pid_yaw; // Front-Left
 
             // Smooth ramping (slew-rate limiting) to prevent battery brownouts
-            const float max_increase_per_tick = 35.0f; // Soft-start ramp rate
+            const float max_increase_per_tick = 4.0f; // Adjusted for 200Hz loop rate
             for (int i = 0; i < 4; i++) {
                 if (target_speed[i] > 780) target_speed[i] = 780; // Hard clamp max current draw on battery
                 if (target_speed[i] < 0) target_speed[i] = 0;
@@ -439,34 +468,38 @@ extern "C" void app_main(void) {
             }
         }
 
-        // --- ENCODE AND SEND TELEMETRY PACKET (18-Byte Big-Endian Offset) ---
-        // MOVED OUTSIDE `if (controller_connected)` so it always broadcasts!
-        
-        // Read ADC for battery 40.2K/10K voltage divider scaling
-        int vbat_raw;
-        adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
-        float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
+        // --- RATE-LIMITED TRANSMISSION (20Hz) ---
+        // Keeps the controller screen smooth but prevents congesting the RF link
+        uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+        if (now_ms - last_telemetry_time >= 50) {
+            last_telemetry_time = now_ms;
 
-        int16_t state_buf_local[9];
-        state_buf_local[0] = (int16_t)(drone_rol * 100); 
-        state_buf_local[1] = (int16_t)(drone_pit * 100); 
-        state_buf_local[2] = (int16_t)(drone_yaw * 100); 
-        state_buf_local[3] = current_rol * 10;  
-        state_buf_local[4] = current_pit * 10;  
-        state_buf_local[5] = current_yaw * 200; 
-        state_buf_local[6] = (int16_t)((current_thr + 100) / 2); 
-        state_buf_local[7] = (int16_t)(vbat * 100);               
-        state_buf_local[8] = (int16_t)(current_height_cm); 
+            // Read ADC for battery 40.2K/10K voltage divider scaling
+            int vbat_raw;
+            adc_oneshot_read(adc_handle, VBAT_ADC_CHANNEL, &vbat_raw);
+            float vbat = ((float)vbat_raw / 4095.0f) * 1.1f * 5.02f;
 
-        uint8_t tx_buf[18];
-        for (int i = 0; i < 9; i++) {
-            uint16_t val_offset = (uint16_t)(state_buf_local[i] + 32768);
-            tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
-            tx_buf[i * 2 + 1] = val_offset & 0xFF;
+            int16_t state_buf_local[9];
+            state_buf_local[0] = (int16_t)(drone_rol * 100); 
+            state_buf_local[1] = (int16_t)(drone_pit * 100); 
+            state_buf_local[2] = (int16_t)(drone_yaw * 100); 
+            state_buf_local[3] = current_rol * 10;  
+            state_buf_local[4] = current_pit * 10;  
+            state_buf_local[5] = current_yaw * 200; 
+            state_buf_local[6] = (int16_t)((current_thr + 100) / 2); 
+            state_buf_local[7] = (int16_t)(vbat * 100);               
+            state_buf_local[8] = (int16_t)(current_height_cm); 
+
+            uint8_t tx_buf[18];
+            for (int i = 0; i < 9; i++) {
+                uint16_t val_offset = (uint16_t)(state_buf_local[i] + 32768);
+                tx_buf[i * 2] = (val_offset >> 8) & 0xFF;
+                tx_buf[i * 2 + 1] = val_offset & 0xFF;
+            }
+            
+            // Send telemetry directly to Broadcast MAC unconditionally 
+            esp_now_send(broadcast_mac, tx_buf, sizeof(tx_buf));
         }
-        
-        // Send telemetry directly to Broadcast MAC unconditionally 
-        esp_now_send(broadcast_mac, tx_buf, sizeof(tx_buf));
 
         // Handle failsafe shutdown separately
         if (controller_connected) {
@@ -475,7 +508,7 @@ extern "C" void app_main(void) {
                 stop_motors();
                 is_flying = false;
                 returning_to_origin = false;
-                controller_connected = false; // Note: Telemetry broadcast keeps running!
+                controller_connected = false; 
                 gpio_set_level(LED_GREEN, 0);
                 ESP_LOGW(TAG, "Connection Lost! Motors powered down.");
             } else {
@@ -483,6 +516,11 @@ extern "C" void app_main(void) {
             }
         }
 
-        gpio_set_level(LED_BLUE, !gpio_get_level(LED_BLUE));
+        // Toggle blinking LED
+        if (now_ms % 250 < 125) {
+            gpio_set_level(LED_BLUE, 1);
+        } else {
+            gpio_set_level(LED_BLUE, 0);
+        }
     }
 }
